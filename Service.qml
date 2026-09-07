@@ -175,6 +175,12 @@ Item {
 
   function openInFiles(remote) {
     if (!remote || !remote.mountPath) return
+    // A folder mounted inside a container is invisible to the host's file
+    // manager, so open a shell in the container at that folder instead.
+    if (Model.isContainer(remote)) {
+      runInTerminal("omarchy-cloud-open", [remote.name])
+      return
+    }
     Quickshell.execDetached(["uwsm-app", "--", "nautilus", Model.fileUri(remote.mountPath)])
   }
 

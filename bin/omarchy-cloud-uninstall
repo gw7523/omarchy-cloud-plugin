@@ -156,7 +156,10 @@ for name in "${!remote_names[@]}"; do
       exit 1
     }
   fi
-  if mountpoint -q "$MOUNT_ROOT/$name" 2>/dev/null; then
+  # A service inside a container has no host mountpoint to check; stopping
+  # its unit above unmounted it there.
+  if ! grep -qE '^env_kind=' "$REMOTE_DIR/$name.conf" 2>/dev/null &&
+      mountpoint -q "$MOUNT_ROOT/$name" 2>/dev/null; then
     echo "omarchy-cloud-uninstall: $MOUNT_ROOT/$name is still mounted; nothing else was removed" >&2
     exit 1
   fi

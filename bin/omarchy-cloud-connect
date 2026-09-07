@@ -4,8 +4,12 @@
 #
 # Runs in a floating terminal launched from the plugin panel. rclone's own
 # `rclone config` is a nested TUI that asks about advanced settings most people
-# have no opinion on; this asks the three questions that matter and infers the
+# have no opinion on; this asks the few questions that matter and infers the
 # rest.
+#
+# A service lives in an environment: this machine, or a container (Distrobox,
+# Docker, Podman) with its own rclone configuration. The wizard detects what
+# is available; with nothing but the host, it never asks.
 #
 set -uo pipefail
 
@@ -22,6 +26,8 @@ BOOKMARK="$BIN_DIR/omarchy-cloud-bookmark"
 source "$BIN_DIR/omarchy-cloud-ui.sh"
 # shellcheck source=omarchy-cloud-rclone-config.sh
 source "$BIN_DIR/omarchy-cloud-rclone-config.sh"
+# shellcheck source=omarchy-cloud-env.sh
+source "$BIN_DIR/omarchy-cloud-env.sh"
 trap hold_open EXIT
 
 abort() {
@@ -41,12 +47,77 @@ cleanup_partial() {
   [[ -n "${CREATED_REMOTE:-}" ]] || return 0
   warn "Removing the half-configured '$CREATED_REMOTE' remote."
   rclone config delete "$CREATED_REMOTE" 2>/dev/null || true
-  rm -f "$REMOTE_DIR/$CREATED_REMOTE.conf"
+  rm -f "$REMOTE_DIR/$SERVICE_ID.conf"
+}
+
+# ---------------------------------------------------------------- environment
+
+ENV_KIND="host"
+ENV_NAME=""
+ENV_USER=""
+ENV_LABEL="Host"
+
+# One line per environment from the mount helper: kind, name, running.
+choose_environment() {
+  local -a kinds=() names=() running=() labels=()
+  local kind name up
+  while IFS=$'\t' read -r kind name up; do
+    [[ -n "$kind" ]] || continue
+    kinds+=("$kind"); names+=("$name"); running+=("$up")
+    if [[ "$kind" == host ]]; then
+      labels+=("This computer")
+    elif [[ "$up" == true ]]; then
+      labels+=("$(env_label "$kind" "$name")")
+    else
+      labels+=("$(env_label "$kind" "$name") (stopped)")
+    fi
+  done < <("$MOUNT" environments 2>/dev/null)
+
+  # Nothing to choose between: stay on the host without asking.
+  ((${#kinds[@]} > 1)) || return 0
+
+  heading "Where should this service live?"
+  echo "A container keeps its own sign-in and mounts the folder inside itself."
+  echo
+
+  local choice i
+  choice="$(printf '%s\n' "${labels[@]}" | gum choose --header "")" || abort "Cancelled."
+  for i in "${!labels[@]}"; do
+    [[ "${labels[$i]}" == "$choice" ]] || continue
+    ENV_KIND="${kinds[$i]}"
+    ENV_NAME="${names[$i]}"
+    [[ "$ENV_KIND" == host ]] && ENV_NAME=""
+    if [[ "$ENV_KIND" != host && "${running[$i]}" != true ]]; then
+      say "Starting $(env_label "$ENV_KIND" "$ENV_NAME")…"
+      env_start "$ENV_KIND" "$ENV_NAME" || abort "Could not start $(env_label "$ENV_KIND" "$ENV_NAME")."
+    fi
+    break
+  done
+
+  # Plain containers run commands as root unless told otherwise, and the
+  # sign-in belongs to whoever owns the files.
+  if [[ "$ENV_KIND" == docker || "$ENV_KIND" == podman ]]; then
+    echo
+    ENV_USER="$(gum input --placeholder "user inside the container (blank for the container default)")" ||
+      abort "Cancelled."
+    [[ -z "$ENV_USER" || "$ENV_USER" =~ ^[A-Za-z0-9._-]+$ ]] || abort "Invalid user name."
+  fi
+
+  ENV_LABEL="$(env_label "$ENV_KIND" "$ENV_NAME")"
+  env_bind_rclone "$ENV_KIND" "$ENV_NAME" "$ENV_USER"
+  say "Connecting in: $ENV_LABEL"
 }
 
 # ---------------------------------------------------------------- rclone
 
 ensure_rclone() {
+  if [[ "$ENV_KIND" != host ]]; then
+    env_has_rclone "$ENV_KIND" "$ENV_NAME" "$ENV_USER" && return 0
+    heading "rclone is not installed in $ENV_LABEL"
+    echo "Install it inside the container with its package manager, then run this again."
+    abort "Cannot continue without rclone in $ENV_LABEL."
+  fi
+
   command -v rclone >/dev/null 2>&1 && return 0
 
   heading "rclone is not installed"
@@ -65,22 +136,92 @@ PROVIDER_LABEL=""
 PROVIDER_TYPE=""
 PROVIDER_DEFAULT_NAME=""
 CUSTOM_PROVIDER=false
+ADOPT_EXISTING=false
+
+# Remotes rclone already knows about in this environment that the plugin does
+# not manage yet: name<TAB>type per line.
+unmanaged_remotes() {
+  local line name type
+  while IFS= read -r line; do
+    name="${line%%:*}"
+    type="$(awk '{print $2}' <<<"$line")"
+    [[ -n "$name" && "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || continue
+    remote_is_managed_here "$name" && continue
+    printf '%s\t%s\n' "$name" "$type"
+  done < <(rclone listremotes --long 2>/dev/null)
+}
+
+# Is this rclone remote, in this environment, already one of ours?
+remote_is_managed_here() {
+  local wanted="$1" file
+  shopt -s nullglob
+  for file in "$REMOTE_DIR"/*.conf; do
+    load_remote_record "$file" "$(basename "$file" .conf)"
+    if [[ "$RECORD_REMOTE" == "$wanted" && "$RECORD_ENV_KIND" == "$ENV_KIND" &&
+          "$RECORD_ENV_NAME" == "$ENV_NAME" ]]; then
+      shopt -u nullglob
+      return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+provider_label_for() {
+  case "$1" in
+    drive)       echo "Google Drive" ;;
+    dropbox)     echo "Dropbox" ;;
+    onedrive)    echo "OneDrive" ;;
+    iclouddrive) echo "iCloud Drive" ;;
+    protondrive) echo "Proton Drive" ;;
+    webdav)      echo "WebDAV" ;;
+    *)           echo "$1" ;;
+  esac
+}
 
 choose_provider() {
   heading "Which service do you want to connect?"
 
+  local -a options=() adopt_names=() adopt_types=()
+  local name type
+  while IFS=$'\t' read -r name type; do
+    [[ -n "$name" ]] || continue
+    adopt_names+=("$name"); adopt_types+=("$type")
+    options+=("Already set up here: $name ($(provider_label_for "$type"))")
+  done < <(unmanaged_remotes)
+
+  options+=(
+    "Google Drive"
+    "Dropbox"
+    "OneDrive"
+    "iCloud Drive"
+    "Proton Drive"
+    "Nextcloud"
+    "Something else (guided by rclone)"
+  )
+
   local choice
-  choice="$(printf '%s\n' \
-    "Google Drive" \
-    "Dropbox" \
-    "OneDrive" \
-    "Something else (guided by rclone)" |
-    gum choose --header "")" || abort "Cancelled."
+  choice="$(printf '%s\n' "${options[@]}" | gum choose --header "")" || abort "Cancelled."
 
   case "$choice" in
-    "Google Drive") PROVIDER_LABEL="Google Drive"; PROVIDER_TYPE="drive";    PROVIDER_DEFAULT_NAME="gdrive" ;;
-    "Dropbox")      PROVIDER_LABEL="Dropbox";      PROVIDER_TYPE="dropbox";  PROVIDER_DEFAULT_NAME="dropbox" ;;
-    "OneDrive")     PROVIDER_LABEL="OneDrive";     PROVIDER_TYPE="onedrive"; PROVIDER_DEFAULT_NAME="onedrive" ;;
+    "Already set up here: "*)
+      local i
+      for i in "${!adopt_names[@]}"; do
+        [[ "$choice" == "Already set up here: ${adopt_names[$i]} ("* ]] || continue
+        ADOPT_EXISTING=true
+        PROVIDER_TYPE="${adopt_types[$i]}"
+        PROVIDER_LABEL="$(provider_label_for "$PROVIDER_TYPE")"
+        PROVIDER_DEFAULT_NAME="${adopt_names[$i]}"
+        REMOTE_NAME="${adopt_names[$i]}"
+        break
+      done
+      ;;
+    "Google Drive") PROVIDER_LABEL="Google Drive"; PROVIDER_TYPE="drive";       PROVIDER_DEFAULT_NAME="gdrive" ;;
+    "Dropbox")      PROVIDER_LABEL="Dropbox";      PROVIDER_TYPE="dropbox";     PROVIDER_DEFAULT_NAME="dropbox" ;;
+    "OneDrive")     PROVIDER_LABEL="OneDrive";     PROVIDER_TYPE="onedrive";    PROVIDER_DEFAULT_NAME="onedrive" ;;
+    "iCloud Drive") PROVIDER_LABEL="iCloud Drive"; PROVIDER_TYPE="iclouddrive"; PROVIDER_DEFAULT_NAME="icloud" ;;
+    "Proton Drive") PROVIDER_LABEL="Proton Drive"; PROVIDER_TYPE="protondrive"; PROVIDER_DEFAULT_NAME="proton" ;;
+    "Nextcloud")    PROVIDER_LABEL="Nextcloud";    PROVIDER_TYPE="webdav";      PROVIDER_DEFAULT_NAME="nextcloud" ;;
     *)
       CUSTOM_PROVIDER=true
       heading "Another rclone backend"
@@ -99,8 +240,14 @@ choose_provider() {
 # ---------------------------------------------------------------- naming
 
 REMOTE_NAME=""
+SERVICE_ID=""
 
 choose_name() {
+  if [[ "$ADOPT_EXISTING" == true ]]; then
+    choose_service_id
+    return 0
+  fi
+
   heading "What should this folder be called?"
   echo "It becomes the folder name under your mount folder, so keep it short."
   echo
@@ -130,6 +277,25 @@ choose_name() {
     fi
     break
   done
+  choose_service_id
+}
+
+# The plugin's own id for the service. It is the rclone remote name unless a
+# service with that name already exists in another environment -- the same
+# "dropbox" can be connected on the host and inside a container.
+choose_service_id() {
+  SERVICE_ID="$REMOTE_NAME"
+  if [[ -e "$REMOTE_DIR/$SERVICE_ID.conf" ]]; then
+    [[ "$ENV_KIND" != host ]] || abort "'$SERVICE_ID' is already connected."
+    local suffix
+    suffix="$(tr -c 'A-Za-z0-9_-' '-' <<<"$ENV_NAME" | sed 's/-*$//')"
+    SERVICE_ID="${REMOTE_NAME}-${suffix}"
+    local n=2
+    while [[ -e "$REMOTE_DIR/$SERVICE_ID.conf" ]]; do
+      SERVICE_ID="${REMOTE_NAME}-${suffix}-$n"
+      n=$((n + 1))
+    done
+  fi
 }
 
 # ---------------------------------------------------------------- auth
@@ -176,12 +342,26 @@ CLIENT_ID=""
 CLIENT_SECRET=""
 APPLE_ID=""
 APPLE_PASSWORD_OBSCURED=""
+PROTON_USERNAME=""
+PROTON_PASSWORD_OBSCURED=""
+PROTON_2FA=""
+WEBDAV_URL=""
+WEBDAV_USER=""
+WEBDAV_PASSWORD_OBSCURED=""
+
+# Passwords are obscured over stdin so the clear text never appears in the
+# process list; rclone only ever receives the obscured form.
+obscure() {
+  rclone obscure - <<<"$1"
+}
 
 # Google is retiring the credentials rclone ships with, so this is a real
 # decision rather than an advanced option, and it belongs in our own words --
 # rclone raises it mid-flow as a bare y/n whose default is "no", which aborts
 # the sign-in for anyone who just presses enter.
 choose_credentials() {
+  [[ "$ADOPT_EXISTING" == true ]] && return 0
+
   if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
     heading "Apple credentials"
     echo "iCloud uses your regular Apple Account password followed by 2FA."
@@ -197,11 +377,52 @@ choose_credentials() {
       abort "Both the Apple ID and password are required."
     fi
 
-    # Feed the password over stdin so the clear text never appears in the
-    # process list. rclone config create receives only its obscured form.
-    APPLE_PASSWORD_OBSCURED="$(rclone obscure - <<<"$apple_password")" ||
+    APPLE_PASSWORD_OBSCURED="$(obscure "$apple_password")" ||
       abort "Could not obscure the Apple password."
     unset apple_password
+    return 0
+  fi
+
+  if [[ "$PROVIDER_TYPE" == "protondrive" ]]; then
+    heading "Proton credentials"
+    echo "Sign in with your Proton account. If two-factor authentication is on,"
+    echo "enter the current code; leave it blank otherwise."
+    echo
+    PROTON_USERNAME="$(gum input --placeholder "Proton username or email")" || abort "Cancelled."
+    local proton_password
+    proton_password="$(gum input --password --placeholder "Proton password")" || abort "Cancelled."
+    [[ -n "$PROTON_USERNAME" && -n "$proton_password" ]] ||
+      abort "Both the username and password are required."
+    PROTON_2FA="$(gum input --placeholder "2FA code (blank if not enabled)")" || abort "Cancelled."
+    PROTON_PASSWORD_OBSCURED="$(obscure "$proton_password")" ||
+      abort "Could not obscure the Proton password."
+    unset proton_password
+    return 0
+  fi
+
+  if [[ "$PROVIDER_TYPE" == "webdav" && "$CUSTOM_PROVIDER" == false ]]; then
+    heading "Nextcloud server"
+    echo "The address you open in the browser, and the login for it. Nextcloud"
+    echo "prefers an app password: Settings → Security → Devices & sessions."
+    echo
+    local server
+    server="$(gum input --placeholder "https://cloud.example.com" --width 60)" || abort "Cancelled."
+    server="${server%/}"
+    [[ "$server" =~ ^https?:// ]] || abort "The server address must start with http:// or https://."
+    WEBDAV_USER="$(gum input --placeholder "Nextcloud username")" || abort "Cancelled."
+    local app_password
+    app_password="$(gum input --password --placeholder "app password")" || abort "Cancelled."
+    [[ -n "$WEBDAV_USER" && -n "$app_password" ]] ||
+      abort "Both the username and password are required."
+    # Nextcloud's files live under this WebDAV path; the bare server address
+    # returns the web UI, not the file tree.
+    case "$server" in
+      */remote.php/dav/files/*) WEBDAV_URL="$server/" ;;
+      *) WEBDAV_URL="$server/remote.php/dav/files/$WEBDAV_USER/" ;;
+    esac
+    WEBDAV_PASSWORD_OBSCURED="$(obscure "$app_password")" ||
+      abort "Could not obscure the app password."
+    unset app_password
     return 0
   fi
 
@@ -240,18 +461,62 @@ choose_credentials() {
   esac
 }
 
+# An existing remote is adopted, not created: check it works, keep everything
+# about it as it is.
+adopt_remote() {
+  heading "Checking $REMOTE_NAME in $ENV_LABEL"
+  if connected "$REMOTE_NAME"; then
+    good "Connected."
+    return 0
+  fi
+  warn "'$REMOTE_NAME' does not answer. It may need signing in again."
+  echo
+  gum confirm --default=false "Sign in to it now?" || abort "Cancelled."
+  local ok=false
+  if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
+    run_icloud_config "$REMOTE_NAME" config update "$REMOTE_NAME" && ok=true
+  elif uses_oauth "$PROVIDER_TYPE"; then
+    rclone config reconnect "$REMOTE_NAME:" && ok=true
+  else
+    rclone config update "$REMOTE_NAME" --all --no-output && ok=true
+  fi
+  [[ "$ok" == true ]] && connected "$REMOTE_NAME" || abort "Sign-in did not complete. Nothing was changed."
+  good "Connected."
+}
+
 create_remote() {
+  if [[ "$ADOPT_EXISTING" == true ]]; then
+    adopt_remote
+    return 0
+  fi
+
   heading "Connecting $PROVIDER_LABEL"
+  [[ "$ENV_KIND" == host ]] || say "rclone runs inside $ENV_LABEL; the sign-in is stored there."
 
   local -a create_args=(config create "$REMOTE_NAME" "$PROVIDER_TYPE")
+  local -a create_options=(--no-output)
   # Ask for the whole drive rather than rclone's narrower default, so files
   # created outside rclone are visible too.
   [[ "$PROVIDER_TYPE" == "drive" ]] && create_args+=(scope=drive)
   [[ -n "$CLIENT_ID" ]] && create_args+=("client_id=$CLIENT_ID")
   [[ -n "$CLIENT_SECRET" ]] && create_args+=("client_secret=$CLIENT_SECRET")
-  if [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
-    create_args+=("service=drive" "apple_id=$APPLE_ID" "password=$APPLE_PASSWORD_OBSCURED")
-  fi
+  case "$PROVIDER_TYPE" in
+    iclouddrive)
+      create_args+=("service=drive" "apple_id=$APPLE_ID" "password=$APPLE_PASSWORD_OBSCURED")
+      ;;
+    protondrive)
+      create_args+=("username=$PROTON_USERNAME" "password=$PROTON_PASSWORD_OBSCURED")
+      [[ -n "$PROTON_2FA" ]] && create_args+=("2fa=$PROTON_2FA")
+      # The password is already obscured; tell rclone not to obscure it again.
+      create_options+=(--no-obscure)
+      ;;
+    webdav)
+      if [[ "$CUSTOM_PROVIDER" == false ]]; then
+        create_args+=("url=$WEBDAV_URL" "vendor=nextcloud" "user=$WEBDAV_USER" "pass=$WEBDAV_PASSWORD_OBSCURED")
+        create_options+=(--no-obscure)
+      fi
+      ;;
+  esac
 
   # Said before rclone starts, because OAuth backends open the browser the
   # moment they get there. Printing this afterwards describes something that
@@ -259,12 +524,17 @@ create_remote() {
   if uses_oauth "$PROVIDER_TYPE"; then
     echo "A browser window will open so you can sign in to $PROVIDER_LABEL."
     echo "Approve access, then come back here."
+    [[ "$ENV_KIND" == host ]] ||
+      echo "If no browser appears from inside $ENV_LABEL, open the link rclone prints."
     [[ "$PROVIDER_TYPE" == "drive" && -z "$CLIENT_ID" ]] &&
       warn "First, rclone asks whether to use its shared credentials — answer y."
     echo
   elif [[ "$PROVIDER_TYPE" == "iclouddrive" ]]; then
     echo "Apple will send a verification prompt to a trusted device."
     echo "Enter the 2FA code here when rclone asks for it."
+    echo
+  elif [[ "$PROVIDER_TYPE" == "protondrive" ]]; then
+    echo "Signing in to Proton. The first login can take a little while."
     echo
   fi
 
@@ -286,7 +556,6 @@ create_remote() {
     # Custom backends need their provider-specific questions (host, bucket,
     # endpoint, credentials, and so on). --all asks those instead of silently
     # accepting unusable empty defaults. Keep completed secrets off the screen.
-    local -a create_options=(--no-output)
     [[ "$CUSTOM_PROVIDER" == "true" ]] && create_options=(--all --no-output)
     if ! rclone "${create_args[@]}" "${create_options[@]}"; then
       cleanup_partial
@@ -329,8 +598,10 @@ create_remote() {
 # ---------------------------------------------------------------- options
 
 EXTRA_FLAGS=""
+MOUNT_DIR=""
 
 provider_options() {
+  [[ "$ADOPT_EXISTING" == true ]] && return 0
   [[ "$PROVIDER_TYPE" == "drive" ]] || return 0
 
   heading "Google Docs, Sheets and Slides"
@@ -372,63 +643,77 @@ choose_gdocs_mode() {
   esac
 }
 
+# An adopted remote may already be mounted somewhere by the container's own
+# scripts. Keep that folder rather than inventing a second one.
+detect_existing_mount() {
+  [[ "$ADOPT_EXISTING" == true ]] || return 0
+  local path
+  path="$(env_exec "$ENV_KIND" "$ENV_NAME" "$ENV_USER" sh -c \
+    'awk -v src="$1" '"'"'{ for (i = 7; i <= NF; i++) if ($i == "-") { if ($(i+2) == src) { print $5; exit } ; break } }'"'"' /proc/self/mountinfo' \
+    sh "$REMOTE_NAME:" 2>/dev/null | head -n 1)"
+  [[ -n "$path" ]] || return 0
+  # mountinfo escapes spaces as \040.
+  path="$(printf '%s' "$path" | sed 's/\\040/ /g')"
+  heading "Already mounted"
+  echo "$REMOTE_NAME is mounted at $path in $ENV_LABEL."
+  if gum confirm "Keep using that folder?"; then
+    MOUNT_DIR="$path"
+  fi
+}
+
 save_remote_config() {
-  local tmp
-  mkdir -p "$REMOTE_DIR" || return 1
-  tmp="$(mktemp "$REMOTE_DIR/.${REMOTE_NAME}.XXXXXX")" || return 1
-  {
-    printf '# Written by omarchy-cloud-connect for the %q remote.\n' "$REMOTE_NAME"
-    echo "# extra_flags is appended to the rclone mount command line."
-    printf 'label=%q\n' "$PROVIDER_LABEL"
-    printf 'extra_flags=%q\n' "$EXTRA_FLAGS"
-  } >"$tmp" || { rm -f "$tmp"; return 1; }
-  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$REMOTE_DIR/$REMOTE_NAME.conf"
+  RECORD_LABEL="$PROVIDER_LABEL"
+  RECORD_EXTRA_FLAGS="$EXTRA_FLAGS"
+  RECORD_REMOTE="$REMOTE_NAME"
+  RECORD_ENV_KIND="$ENV_KIND"
+  RECORD_ENV_NAME="$ENV_NAME"
+  RECORD_ENV_USER="$ENV_USER"
+  RECORD_MOUNT_DIR="$MOUNT_DIR"
+  write_remote_record "$REMOTE_DIR/$SERVICE_ID.conf" "$SERVICE_ID" omarchy-cloud-connect
 }
 
 # ---------------------------------------------------------------- mount
 
-mount_root() {
-  local root="$HOME/Cloud"
-  # shellcheck source=/dev/null
-  [[ -f "$CONFIG_DIR/settings.conf" ]] && source "$CONFIG_DIR/settings.conf"
-  echo "${MOUNT_ROOT:-$root}" | sed "s|^~|$HOME|"
-}
-
 mount_it() {
   heading "Mounting"
 
-  local root mount_point
-  root="$(mount_root)"
-  mount_point="$root/$REMOTE_NAME"
+  local mount_point
+  mount_point="$("$MOUNT" mount-dir "$SERVICE_ID" 2>/dev/null)" || mount_point=""
 
   "$MOUNT" install-unit >/dev/null || abort "Could not install the systemd unit."
 
-  if ! "$MOUNT" enable "$REMOTE_NAME"; then
-    abort "systemd could not start the mount. See: journalctl --user -u omarchy-cloud-mount@$REMOTE_NAME"
+  if ! "$MOUNT" enable "$SERVICE_ID"; then
+    abort "systemd could not start the mount. See: journalctl --user -u omarchy-cloud-mount@$SERVICE_ID"
   fi
 
   # A bookmark represents a connected service, not just its current process.
-  # Add it before waiting so a slow first mount still appears in Files.
-  if ! "$BOOKMARK" add "$mount_point" "$PROVIDER_LABEL" 2>/dev/null; then
-    warn "Could not add the Files sidebar bookmark."
+  # Add it before waiting so a slow first mount still appears in Files. Only
+  # the host's file manager can see a host folder.
+  if [[ "$ENV_KIND" == host && -n "$mount_point" ]]; then
+    if ! "$BOOKMARK" add "$mount_point" "$PROVIDER_LABEL" 2>/dev/null; then
+      warn "Could not add the Files sidebar bookmark."
+    fi
   fi
 
   # `systemctl enable --now` returns as soon as the unit is active, and with
   # Type=notify that already means the mountpoint is live. Confirm anyway --
   # a bookmark pointing at nothing is the one outcome worth preventing.
   local waited=0
-  while ! mountpoint -q "$mount_point" 2>/dev/null; do
+  while ! "$MOUNT" is-mounted "$SERVICE_ID" 2>/dev/null; do
     sleep 1
     waited=$((waited + 1))
     if ((waited >= 20)); then
       warn "The mount hasn't appeared yet. It may still be starting."
-      warn "Check with: systemctl --user status omarchy-cloud-mount@$REMOTE_NAME"
+      warn "Check with: systemctl --user status omarchy-cloud-mount@$SERVICE_ID"
       return 0
     fi
   done
 
-  good "Mounted at $mount_point"
+  if [[ "$ENV_KIND" == host ]]; then
+    good "Mounted at $mount_point"
+  else
+    good "Mounted at $mount_point inside $ENV_LABEL"
+  fi
 }
 
 # ---------------------------------------------------------------- main
@@ -436,12 +721,14 @@ mount_it() {
 main() {
   title "Connect a cloud service"
 
+  choose_environment
   ensure_rclone
   choose_provider
   choose_name
   choose_credentials
   create_remote
   provider_options
+  detect_existing_mount
   save_remote_config || abort "Could not save the plugin's ownership record."
   # Past this point the remote is real and worth keeping even if mounting
   # fails, so stop offering to tear it down.
@@ -450,7 +737,11 @@ main() {
 
   echo
   good "$PROVIDER_LABEL is ready."
-  echo "Open it from the Cloud panel in your bar, or find it in the Files sidebar."
+  if [[ "$ENV_KIND" == host ]]; then
+    echo "Open it from the Cloud panel in your bar, or find it in the Files sidebar."
+  else
+    echo "Open it from the Cloud panel in your bar; that opens a shell inside $ENV_LABEL."
+  fi
   echo
   warn "One thing worth knowing: deleting a file here skips the desktop trash."
   warn "$PROVIDER_LABEL keeps its own trash, so files are usually recoverable there."

@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "furmware.cloud",
   "name": "Cloud",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "author": "furmware",
   "license": "MIT",
-  "description": "Mount Google Drive, Dropbox, OneDrive and other cloud storage into your file manager with rclone.",
+  "description": "Mount Google Drive, Dropbox, OneDrive, iCloud, Proton Drive, Nextcloud and other cloud storage into your file manager with rclone — on this machine or inside Distrobox, Docker and Podman containers.",
   "kinds": [
     "service",
     "bar-widget"
@@ -40,7 +40,12 @@
         "key": "vfsCacheMode",
         "type": "enum",
         "label": "File cache",
-        "options": ["off", "minimal", "writes", "full"],
+        "options": [
+          "off",
+          "minimal",
+          "writes",
+          "full"
+        ],
         "defaultValue": "full",
         "description": "How much rclone caches on disk. 'full' is required for editing files in place from most applications and lets recently opened files work offline. 'off' will break saving in many editors."
       },

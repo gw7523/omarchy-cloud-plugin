@@ -12,6 +12,10 @@
 #   omarchy-cloud-mount enable gdrive    # mount now + at login
 #   omarchy-cloud-mount status
 #
+# A service may live in a container (see omarchy-cloud-env.sh). The unit is
+# still a host user unit; `run` then starts rclone inside the container, waits
+# for the mountpoint to appear there, and tells systemd it is ready.
+#
 set -euo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-cloud"
@@ -23,17 +27,24 @@ LEGACY_UNIT_NAME="rclone-mount@.service"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-cloud"
 MANAGED_MARKER="# Managed by furmware.cloud; do not edit."
 SELF="$(realpath "${BASH_SOURCE[0]}")"
+BIN_DIR="$(dirname "$SELF")"
+
+# shellcheck source=omarchy-cloud-env.sh
+source "$BIN_DIR/omarchy-cloud-env.sh"
 
 # Defaults, overridden by settings.conf, which the plugin rewrites whenever its
 # settings change. systemd starts units at login with no idea what shell.json
 # says, so this has to live on disk rather than being passed in.
 MOUNT_ROOT="$HOME/Cloud"
+MOUNT_ROOT_RAW="~/Cloud"
 VFS_CACHE_MODE="full"
 CACHE_MAX_SIZE_GB="8"
 
 load_settings() {
   # shellcheck source=/dev/null
   [[ -f "$SETTINGS_FILE" ]] && source "$SETTINGS_FILE"
+  # Keep the unexpanded form: inside a container "~" is that container's home.
+  MOUNT_ROOT_RAW="$MOUNT_ROOT"
   MOUNT_ROOT="${MOUNT_ROOT/#\~/$HOME}"
 }
 
@@ -66,11 +77,6 @@ valid_name() {
   [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]
 }
 
-remote_exists() {
-  require_rclone
-  rclone listremotes 2>/dev/null | grep -qx "$1:"
-}
-
 remote_is_managed() {
   local file="$REMOTE_DIR/$1.conf"
   [[ -f "$file" && ! -L "$file" ]]
@@ -79,6 +85,52 @@ remote_is_managed() {
 require_managed_remote() {
   remote_is_managed "$1" ||
     die "refusing to manage '$1': it has no furmware.cloud ownership record"
+}
+
+# Loads the service's record into RECORD_* and binds `rclone` to its
+# environment, so everything after this call talks to the right rclone.
+load_service() {
+  local name="$1"
+  load_remote_record "$REMOTE_DIR/$name.conf" "$name"
+  env_bind_rclone "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" "$RECORD_ENV_USER"
+}
+
+service_is_remote() {
+  [[ "${RECORD_ENV_KIND:-host}" != host ]]
+}
+
+service_env_label() {
+  env_label "${RECORD_ENV_KIND:-host}" "${RECORD_ENV_NAME:-}"
+}
+
+require_service_env() {
+  service_is_remote || return 0
+  env_tool_available "$RECORD_ENV_KIND" ||
+    die "$RECORD_ENV_KIND is not installed, so $(service_env_label) cannot be reached"
+  env_exists "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" ||
+    die "$(service_env_label) does not exist"
+}
+
+# The rclone remote behind a service, checked where that rclone lives.
+remote_exists() {
+  local name="$1"
+  service_is_remote || require_rclone
+  rclone listremotes 2>/dev/null | grep -qx "$RECORD_REMOTE:"
+}
+
+service_mount_dir() {
+  local name="$1"
+  resolve_mount_dir "$name" "$MOUNT_ROOT_RAW" ||
+    die "could not work out the mount folder for '$name' in $(service_env_label)"
+}
+
+service_mounted() {
+  local name="$1" dir="$2"
+  if service_is_remote; then
+    env_mounted "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" "$RECORD_ENV_USER" "$dir"
+  else
+    mountpoint -q "$dir" 2>/dev/null
+  fi
 }
 
 rclone_config_path() {
@@ -107,6 +159,7 @@ cmd_settings() {
   local tmp
   mkdir -p "$CONFIG_DIR"
   load_settings
+  MOUNT_ROOT="$MOUNT_ROOT_RAW"
 
   for pair in "$@"; do
     local key="${pair%%=*}" value="${pair#*=}"
@@ -215,8 +268,10 @@ After=network-online.target
 [Service]
 # rclone speaks sd_notify, so the unit only reaches "active" once the
 # mountpoint is genuinely usable -- the panel is not left claiming a mount is
-# ready while it is still being set up.
+# ready while it is still being set up. For a mount inside a container the
+# wrapper sends the notification itself once the mountpoint appears there.
 Type=notify
+NotifyAccess=all
 ExecStart=$quoted_self run %i
 # SIGTERM normally unmounts cleanly. The post-stop helper only detaches a stale
 # FUSE mount left by a crash and reads the current mount root at that moment.
@@ -235,7 +290,29 @@ EOF
   echo "Installed $unit_file"
 }
 
+# Units written before 0.3 lack NotifyAccess=all, which container mounts need
+# to report readiness. Rewrite only a template this plugin owns.
+ensure_unit_current() {
+  local file="$UNIT_DIR/$UNIT_NAME"
+  unit_file_is_managed "$file" || return 0
+  grep -q '^NotifyAccess=all' "$file" 2>/dev/null && return 0
+  cmd_install_unit >/dev/null
+}
+
 # ---------------------------------------------------------------- the mount
+
+mount_flags() {
+  local cache_dir="$1"
+  printf '%s\n' \
+    --cache-dir "$cache_dir" \
+    --vfs-cache-mode "$VFS_CACHE_MODE" \
+    --vfs-cache-max-size "${CACHE_MAX_SIZE_GB}G" \
+    --vfs-cache-max-age 168h \
+    --dir-cache-time 72h \
+    --poll-interval 1m \
+    --umask 077 \
+    --log-level INFO
+}
 
 # Executed by systemd. Uses exec so the PID systemd watches is rclone's own,
 # which is what keeps Type=notify working through this wrapper.
@@ -244,15 +321,18 @@ cmd_run() {
   [[ -n "$name" ]] || die "usage: omarchy-cloud-mount run <remote>"
   valid_name "$name" || die "invalid remote name: $name"
   require_managed_remote "$name"
-  require_rclone
   load_settings
+  load_service "$name"
 
-  local extra_flags="" rclone_config
-  # shellcheck source=/dev/null
-  [[ -f "$REMOTE_DIR/$name.conf" ]] && source "$REMOTE_DIR/$name.conf"
+  if service_is_remote; then
+    run_in_environment "$name"
+    return
+  fi
+
+  require_rclone
+  local rclone_config mount_point
   rclone_config="$(rclone_config_path)"
-
-  local mount_point="$MOUNT_ROOT/$name"
+  mount_point="$(service_mount_dir "$name")"
   mkdir -p "$mount_point"
 
   # A previous crash can leave the mountpoint attached but dead, which makes
@@ -263,27 +343,123 @@ cmd_run() {
     fusermount3 -uz "$mount_point" 2>/dev/null || true
   fi
 
-  local -a args=(
-    mount "$name:" "$mount_point"
-    --config "$rclone_config"
-    --cache-dir "$CACHE_ROOT/rclone"
-    --vfs-cache-mode "$VFS_CACHE_MODE"
-    --vfs-cache-max-size "${CACHE_MAX_SIZE_GB}G"
-    --vfs-cache-max-age 168h
-    --dir-cache-time 72h
-    --poll-interval 1m
-    --umask 077
-    --log-level INFO
-  )
+  local -a args=(mount "$RECORD_REMOTE:" "$mount_point" --config "$rclone_config")
+  local flag
+  while IFS= read -r flag; do args+=("$flag"); done < <(mount_flags "$CACHE_ROOT/rclone")
 
   # Per-remote flags, e.g. Google Docs export formats. Word-split on purpose;
   # the wizard only ever writes flags without embedded spaces.
-  if [[ -n "$extra_flags" ]]; then
-    read -ra split <<<"$extra_flags"
+  if [[ -n "$RECORD_EXTRA_FLAGS" ]]; then
+    read -ra split <<<"$RECORD_EXTRA_FLAGS"
     args+=("${split[@]}")
   fi
 
   exec rclone "${args[@]}"
+}
+
+notify_ready() {
+  [[ -n "${NOTIFY_SOCKET:-}" ]] || return 0
+  command -v systemd-notify >/dev/null 2>&1 || return 0
+  systemd-notify --ready 2>/dev/null || true
+}
+
+# The container variant. This process stays the unit's main PID: it starts
+# rclone inside the container, waits for the mountpoint to show up in the
+# container's mount table, and only then tells systemd the unit is ready.
+#
+# Stopping is explicit. Killing a `docker exec` client does not kill the
+# process it started, so SIGTERM here unmounts inside the container, which is
+# what makes that rclone exit.
+run_in_environment() {
+  local name="$1"
+  local kind="$RECORD_ENV_KIND" box="$RECORD_ENV_NAME" user="$RECORD_ENV_USER"
+  local label
+  label="$(service_env_label)"
+
+  require_service_env
+  env_running "$kind" "$box" || env_start "$kind" "$box" ||
+    die "$label is not running and could not be started"
+  env_has_rclone "$kind" "$box" "$user" ||
+    die "rclone is not installed in $label"
+
+  local mount_point home cache_dir
+  mount_point="$(service_mount_dir "$name")"
+  home="$(env_home "$kind" "$box" "$user")" || home=""
+  cache_dir="${home:-/tmp}/.cache/omarchy-cloud/rclone"
+
+  env_exec "$kind" "$box" "$user" mkdir -p "$mount_point" "$cache_dir" ||
+    die "could not create $mount_point in $label"
+
+  local child="" term_requested=0
+  on_term() {
+    term_requested=1
+    env_unmount "$kind" "$box" "$user" "$mount_point" || true
+    [[ -n "$child" ]] && kill "$child" 2>/dev/null || true
+  }
+  trap on_term TERM INT
+
+  # Something else already mounted it there (the container's own login
+  # scripts, say). Do not fight it: report ready, watch it, and let a stop
+  # request unmount it like any other mount.
+  if env_mounted "$kind" "$box" "$user" "$mount_point"; then
+    echo "Already mounted at $mount_point in $label; supervising the existing mount."
+    notify_ready
+    while ((term_requested == 0)) && env_mounted "$kind" "$box" "$user" "$mount_point"; do
+      sleep 15 &
+      child=$!
+      wait "$child" 2>/dev/null || true
+      child=""
+    done
+    exit 0
+  fi
+
+  # Clear a stale mountpoint left by a crash, as on the host.
+  env_unmount "$kind" "$box" "$user" "$mount_point" || true
+
+  local -a args=(mount "$RECORD_REMOTE:" "$mount_point")
+  local flag
+  while IFS= read -r flag; do args+=("$flag"); done < <(mount_flags "$cache_dir")
+  if [[ -n "$RECORD_EXTRA_FLAGS" ]]; then
+    read -ra split <<<"$RECORD_EXTRA_FLAGS"
+    args+=("${split[@]}")
+  fi
+
+  env_exec "$kind" "$box" "$user" rclone "${args[@]}" &
+  child=$!
+
+  local waited=0
+  while ! env_mounted "$kind" "$box" "$user" "$mount_point"; do
+    if ! kill -0 "$child" 2>/dev/null; then
+      wait "$child" && exit 1 || exit $?
+    fi
+    ((term_requested == 0)) || break
+    sleep 1
+    waited=$((waited + 1))
+    if ((waited >= 60)); then
+      echo "omarchy-cloud-mount: $mount_point did not appear in $label after 60s" >&2
+      on_term
+      wait "$child" 2>/dev/null || true
+      exit 1
+    fi
+  done
+  echo "Mounted $RECORD_REMOTE: at $mount_point in $label"
+  notify_ready
+
+  local status=0
+  while :; do
+    if wait "$child"; then
+      status=0
+      break
+    fi
+    status=$?
+    # A signal interrupts wait; keep waiting for the real exit status.
+    if ((status > 128)) && kill -0 "$child" 2>/dev/null; then
+      continue
+    fi
+    break
+  done
+  ((term_requested == 0)) || exit 0
+  exit "$status"
 }
 
 # Called by ExecStopPost after rclone exits. It is deliberately idempotent.
@@ -292,7 +468,16 @@ cmd_cleanup() {
   [[ -n "$name" ]] || die "usage: omarchy-cloud-mount cleanup <remote>"
   valid_name "$name" || die "invalid remote name: $name"
   load_settings
-  local mount_point="$MOUNT_ROOT/$name"
+  load_service "$name"
+  local mount_point
+  mount_point="$(resolve_mount_dir "$name" "$MOUNT_ROOT_RAW" 2>/dev/null)" || return 0
+  if service_is_remote; then
+    env_running "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" || return 0
+    if env_mounted "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" "$RECORD_ENV_USER" "$mount_point"; then
+      env_unmount "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" "$RECORD_ENV_USER" "$mount_point" || true
+    fi
+    return 0
+  fi
   if mountpoint -q "$mount_point" 2>/dev/null; then
     fusermount3 -uz "$mount_point" 2>/dev/null || true
   fi
@@ -344,6 +529,7 @@ ensure_unit() {
   if [[ ! -f "$UNIT_DIR/$UNIT_NAME" ]]; then
     cmd_install_unit >/dev/null
   else
+    ensure_unit_current
     migrate_legacy_unit >/dev/null
   fi
 }
@@ -368,11 +554,36 @@ cmd_is_enabled() {
     systemctl --user is-enabled --quiet "$(legacy_unit_for "$name")" 2>/dev/null
 }
 
+# Is the folder live, wherever it lives? Answers for the wizard's "did the
+# mount appear" loop and for scripts that want to know without parsing JSON.
+cmd_is_mounted() {
+  local name="${1:?usage: omarchy-cloud-mount is-mounted <remote>}"
+  valid_name "$name" || die "invalid remote name: $name"
+  require_managed_remote "$name"
+  load_settings
+  load_service "$name"
+  local dir
+  dir="$(resolve_mount_dir "$name" "$MOUNT_ROOT_RAW" 2>/dev/null)" || return 1
+  service_mounted "$name" "$dir"
+}
+
+# The resolved mount folder, for display.
+cmd_mount_dir() {
+  local name="${1:?usage: omarchy-cloud-mount mount-dir <remote>}"
+  valid_name "$name" || die "invalid remote name: $name"
+  require_managed_remote "$name"
+  load_settings
+  load_service "$name"
+  service_mount_dir "$name"
+}
+
 cmd_enable() {
   local name="${1:?usage: omarchy-cloud-mount enable <remote>}"
   valid_name "$name" || die "invalid remote name: $name"
   require_managed_remote "$name"
-  remote_exists "$name" || die "no such remote: $name"
+  load_service "$name"
+  require_service_env
+  remote_exists "$name" || die "no such remote: $RECORD_REMOTE (in $(service_env_label))"
   ensure_unit
   systemctl --user enable --now "$(unit_for "$name")"
 }
@@ -400,7 +611,9 @@ cmd_start() {
   local name="${1:?usage: omarchy-cloud-mount start <remote>}"
   valid_name "$name" || die "invalid remote name: $name"
   require_managed_remote "$name"
-  remote_exists "$name" || die "no such remote: $name"
+  load_service "$name"
+  require_service_env
+  remote_exists "$name" || die "no such remote: $RECORD_REMOTE (in $(service_env_label))"
   ensure_unit
   systemctl --user start "$(unit_for "$name")"
 }
@@ -427,7 +640,9 @@ cmd_restart() {
   valid_name "$name" || die "invalid remote name: $name"
   require_managed_remote "$name"
   cmd_is_active "$name" || return 0
-  remote_exists "$name" || die "no such remote: $name"
+  load_service "$name"
+  require_service_env
+  remote_exists "$name" || die "no such remote: $RECORD_REMOTE (in $(service_env_label))"
   ensure_unit
   systemctl --user restart "$(unit_for "$name")"
 }
@@ -449,11 +664,19 @@ cmd_forget() {
   valid_name "$name" || die "invalid remote name: $name"
   require_managed_remote "$name"
   load_settings
+  load_service "$name"
+
+  local mount_point
+  mount_point="$(resolve_mount_dir "$name" "$MOUNT_ROOT_RAW" 2>/dev/null)" || mount_point="$MOUNT_ROOT/$name"
 
   if [[ "$confirm" != "--yes" ]]; then
     echo "This will disconnect '$name':"
-    echo "  - unmount and disable $MOUNT_ROOT/$name"
-    echo "  - delete the rclone remote and its stored credentials"
+    echo "  - unmount and disable $mount_point"
+    if service_is_remote; then
+      echo "  - delete the rclone remote '$RECORD_REMOTE' and its stored credentials in $(service_env_label)"
+    else
+      echo "  - delete the rclone remote and its stored credentials"
+    fi
     echo "  - remove its file manager bookmark"
     echo "Nothing in the cloud is deleted. Re-run with --yes to confirm."
     return 1
@@ -462,40 +685,50 @@ cmd_forget() {
   # Stop the mount before changing rclone's config, then ask rclone to remove
   # only this remote's section. Do not copy the shared config: that would retain
   # this token and every unrelated remote's credentials outside rclone.conf.
-  require_rclone
+  service_is_remote || require_rclone
   cmd_disable "$name"
-  if mountpoint -q "$MOUNT_ROOT/$name" 2>/dev/null; then
-    die "the mount at '$MOUNT_ROOT/$name' is still active; credentials and metadata were kept"
+  if service_is_remote && ! env_running "$RECORD_ENV_KIND" "$RECORD_ENV_NAME"; then
+    die "$(service_env_label) is not running; credentials and metadata were kept"
+  fi
+  if service_mounted "$name" "$mount_point"; then
+    die "the mount at '$mount_point' is still active; credentials and metadata were kept"
   fi
 
   local remotes
   if ! remotes="$(rclone listremotes 2>/dev/null)"; then
     die "could not read rclone's remote list; credentials and metadata were kept"
   fi
-  if grep -Fqx "$name:" <<<"$remotes"; then
-    if ! rclone config delete "$name" >/dev/null; then
-      die "could not delete rclone remote '$name'; its credentials may still be saved"
+  if grep -Fqx "$RECORD_REMOTE:" <<<"$remotes"; then
+    if ! rclone config delete "$RECORD_REMOTE" >/dev/null; then
+      die "could not delete rclone remote '$RECORD_REMOTE'; its credentials may still be saved"
     fi
   fi
 
   # Do not claim success or remove the ownership record unless the credential
   # deletion can be verified. Keeping the record lets the user retry safely.
   if ! remotes="$(rclone listremotes 2>/dev/null)"; then
-    die "could not verify deletion of rclone remote '$name'; plugin metadata was kept"
+    die "could not verify deletion of rclone remote '$RECORD_REMOTE'; plugin metadata was kept"
   fi
-  if grep -Fqx "$name:" <<<"$remotes"; then
-    die "rclone remote '$name' still exists; plugin metadata was kept"
+  if grep -Fqx "$RECORD_REMOTE:" <<<"$remotes"; then
+    die "rclone remote '$RECORD_REMOTE' still exists; plugin metadata was kept"
   fi
 
-  "$(dirname "$SELF")/omarchy-cloud-bookmark" remove "$MOUNT_ROOT/$name" 2>/dev/null || true
+  if ! service_is_remote; then
+    "$BIN_DIR/omarchy-cloud-bookmark" remove "$mount_point" 2>/dev/null || true
+    rmdir "$mount_point" 2>/dev/null || true
+  fi
   rm -f "$REMOTE_DIR/$name.conf"
-  rmdir "$MOUNT_ROOT/$name" 2>/dev/null || true
   echo "Disconnected $name."
 }
 
 cmd_status() {
   load_settings
-  "$(dirname "$SELF")/omarchy-cloud-status" --root "$MOUNT_ROOT" "$@"
+  "$BIN_DIR/omarchy-cloud-status" --root "$MOUNT_ROOT_RAW" "$@"
+}
+
+# Everything this machine could host a service in, as the wizard sees it.
+cmd_environments() {
+  env_list
 }
 
 # ---------------------------------------------------------------- dispatch
@@ -512,9 +745,12 @@ case "${1:-}" in
   restart)      shift; cmd_restart "$@" ;;
   is-active)    shift; cmd_is_active "$@" ;;
   is-enabled)   shift; cmd_is_enabled "$@" ;;
+  is-mounted)   shift; cmd_is_mounted "$@" ;;
+  mount-dir)    shift; cmd_mount_dir "$@" ;;
   toggle)       shift; cmd_toggle "$@" ;;
   forget)       shift; cmd_forget "$@" ;;
   status)       shift; cmd_status "$@" ;;
+  environments) shift; cmd_environments "$@" ;;
   *)
     cat <<'EOF'
 Usage: omarchy-cloud-mount <command> [args]
@@ -526,8 +762,11 @@ Usage: omarchy-cloud-mount <command> [args]
   disable <remote>        Unmount and stop mounting at login
   start|stop|restart <r>  Control a mount for this session
   toggle <remote>         Toggle a mount for this session
+  is-mounted <remote>     Exit 0 when the folder is live in its environment
+  mount-dir <remote>      Print the resolved mount folder
   forget <remote> --yes   Disconnect a service and delete its credentials
   status [--with-quota]   Print JSON state for all remotes
+  environments            List host and container environments (kind, name, running)
 EOF
     exit 1
     ;;

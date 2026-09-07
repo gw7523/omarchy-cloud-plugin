@@ -2,8 +2,10 @@
 
 ![Preview](preview.png)
 
-Mount Google Drive, Dropbox, OneDrive and other cloud storage as ordinary
-folders on Omarchy, with connection status in the bar.
+Mount Google Drive, Dropbox, OneDrive, iCloud Drive, Proton Drive, Nextcloud
+and other cloud storage as ordinary folders on Omarchy, with connection status
+in the bar. A service can live on this machine or inside a Distrobox, Docker
+or Podman container that keeps its own sign-in.
 
 Files appear in Nautilus like any other folder — open, edit, save, delete.
 Behind the scenes it is [rclone](https://rclone.org/) mounted through FUSE and
@@ -32,7 +34,8 @@ for your password. You can install it yourself first with the same command.
 ## Connecting a service
 
 Click the cloud icon in the bar, then **Connect a service…**. A terminal opens
-and asks which provider to use, what to call the folder, and any credentials or
+and asks where the service should live (only when containers are present),
+which provider to use, what to call the folder, and any credentials or
 provider-specific choices it needs.
 
 For another rclone backend, choose **Something else (guided by rclone)** and
@@ -41,9 +44,40 @@ questions; for example, SFTP asks for its host and user instead of silently
 creating an empty connection.
 
 OAuth services sign in through your browser. iCloud uses your regular Apple
-Account password and then asks for a 2FA code in the terminal. When sign-in
-finishes, the folder is mounted, bookmarked in the Files sidebar, and set to
-mount again at every login.
+Account password and then asks for a 2FA code in the terminal. Proton Drive
+asks for your password and a 2FA code; Nextcloud asks for the server address,
+your user name and an app password. When sign-in finishes, the folder is
+mounted, bookmarked in the Files sidebar, and set to mount again at every
+login.
+
+## Containers
+
+If `distrobox`, `docker` or `podman` is installed, the wizard lists every
+container it finds next to **This computer** and asks where the new service
+should live. Pick a container and:
+
+- rclone runs *inside* the container, using the container's own
+  `rclone.conf`. Credentials never leave it.
+- The folder is mounted inside the container's mount namespace, under
+  `~/Cloud/<name>` there (the mount folder setting, with `~` meaning that
+  container's home), or at a folder you choose when adopting an existing
+  mount.
+- The systemd user unit on the host still supervises the mount: it starts
+  rclone through `distrobox enter`, `docker exec` or `podman exec`, waits for
+  the mountpoint to appear in the container, and reports ready. Stopping the
+  unit unmounts inside the container. A stopped container is started first.
+- **Open** on such a row opens a shell inside the container at the folder,
+  because the host's file manager cannot see into another mount namespace.
+
+Remotes that already exist in a container (or on the host) but were set up
+outside this plugin appear in the wizard as **Already set up here: …**.
+Choosing one adopts it without re-authenticating; if it is already mounted
+somewhere, the wizard offers to keep that folder. Two services may share an
+rclone remote name across environments — the panel shows which container
+each one lives in.
+
+For Docker and Podman the wizard also asks which user inside the container
+should own the sign-in; leave it blank for the container's default user.
 
 ## What it does to your system
 
@@ -58,7 +92,7 @@ marker. Existing rclone remotes not created by this plugin are ignored.
 | `~/Cloud/<name>/` | Where each service is mounted |
 | rclone's active config (normally `~/.config/rclone/rclone.conf`) | Credentials for services you explicitly connect; the plugin honors the path reported by `rclone config file` |
 | `~/.config/omarchy-cloud/settings.conf` | Mount flags, read by systemd at login |
-| `~/.config/omarchy-cloud/remotes/<name>.conf` | Per-service mount flags and plugin ownership record |
+| `~/.config/omarchy-cloud/remotes/<name>.conf` | Per-service mount flags, plugin ownership record, and where it lives (`env_kind`, `env_name`, `mount_dir`) |
 | `~/.config/systemd/user/omarchy-cloud-mount@.service` | Generated systemd user unit |
 | `~/.config/gtk-3.0/bookmarks` | One sidebar line per connected service |
 | `~/.cache/omarchy-cloud/` | Quota responses and the size-capped file cache |
@@ -163,6 +197,8 @@ CLOUD_PLUGIN="$HOME/.config/omarchy/plugins/furmware.cloud"
 "$CLOUD_PLUGIN/bin/omarchy-cloud-mount" stop gdrive         # this session
 "$CLOUD_PLUGIN/bin/omarchy-cloud-mount" run gdrive          # foreground mount
 "$CLOUD_PLUGIN/bin/omarchy-cloud-mount" forget gdrive --yes # delete credentials
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" environments       # host + containers
+"$CLOUD_PLUGIN/bin/omarchy-cloud-mount" is-mounted sfl-dropbox # inside its container
 
 systemctl --user status omarchy-cloud-mount@gdrive
 journalctl --user -u omarchy-cloud-mount@gdrive -f

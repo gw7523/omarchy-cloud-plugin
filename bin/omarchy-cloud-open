@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# Open a service's folder.
+#
+# On the host that is the file manager. A folder mounted inside a container
+# only exists in that container's mount namespace, so the host's file manager
+# would show an empty directory; a shell inside the container at that folder
+# is the honest equivalent. Runs in the plugin's floating terminal.
+#
+set -uo pipefail
+
+BIN_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+MOUNT="$BIN_DIR/omarchy-cloud-mount"
+# shellcheck source=omarchy-cloud-env.sh
+source "$BIN_DIR/omarchy-cloud-env.sh"
+
+name="${1:?usage: omarchy-cloud-open <service>}"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-cloud"
+REMOTE_FILE="$CONFIG_DIR/remotes/$name.conf"
+[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ && -f "$REMOTE_FILE" && ! -L "$REMOTE_FILE" ]] || {
+  echo "omarchy-cloud-open: '$name' is not managed by furmware.cloud." >&2
+  exit 1
+}
+
+load_remote_record "$REMOTE_FILE" "$name"
+dir="$("$MOUNT" mount-dir "$name")" || exit 1
+
+if [[ "$RECORD_ENV_KIND" == host ]]; then
+  exec uwsm-app -- nautilus "$dir"
+fi
+
+env_running "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" || {
+  echo "omarchy-cloud-open: $(env_label "$RECORD_ENV_KIND" "$RECORD_ENV_NAME") is not running." >&2
+  exit 1
+}
+
+# Interactive shell at the mount folder, using whatever login shell the
+# container gives the user.
+exec env_exec "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" "$RECORD_ENV_USER" \
+  sh -c 'cd "$1" 2>/dev/null || { echo "not mounted: $1" >&2; exec "${SHELL:-sh}" -l; }; exec "${SHELL:-sh}" -l' sh "$dir"

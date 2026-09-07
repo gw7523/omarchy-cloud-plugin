@@ -7,6 +7,9 @@ directly rather than shelled out to, and mount state comes from
 storage usage -- lives behind `--with-quota` and a disk cache, because it costs
 a round trip per remote and the panel polls far too often to pay that.
 
+Services that live in a container are probed with one exec per container:
+rclone's redacted config (never secrets) and that container's own mount table.
+
 Usage:
     omarchy-cloud-status [--root DIR] [--with-quota] [--quota-age SECONDS]
 """
@@ -16,6 +19,7 @@ import configparser
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -31,6 +35,7 @@ PROVIDER_LABELS = {
     "box": "Box",
     "pcloud": "pCloud",
     "iclouddrive": "iCloud Drive",
+    "protondrive": "Proton Drive",
     "mega": "MEGA",
     "s3": "S3",
     "b2": "Backblaze B2",
@@ -45,12 +50,24 @@ CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "om
 STATE_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "omarchy-cloud"
 UNIT_PREFIXES = ("omarchy-cloud-mount@", "rclone-mount@")
 REMOTE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+ENV_KINDS = ("host", "distrobox", "docker", "podman")
 MOUNTINFO_ESCAPE_PATTERN = re.compile(r"\\([0-7]{3})")
 ICLOUD_STORAGE_URL = "https://setup.icloud.com/setup/ws/1/storageUsageInfo"
 ICLOUD_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) "
     "Version/18.3.1 Safari/605.1.15"
+)
+
+# One round trip per container: where home is, whether rclone exists, the
+# redacted remote list, and the container's mount table. Plain sh, no
+# dependencies beyond coreutils, so it works in minimal images too.
+ENV_PROBE_SCRIPT = (
+    'printf "@@HOME\\n%s\\n" "$HOME"; '
+    'printf "@@RCLONE\\n"; command -v rclone >/dev/null 2>&1 && echo yes || echo no; '
+    'printf "@@CONFIG\\n"; rclone config redacted 2>/dev/null; '
+    'printf "@@MOUNTS\\n"; cat /proc/self/mountinfo 2>/dev/null'
 )
 
 
@@ -88,91 +105,223 @@ def config_path():
     return config_home / "rclone" / "rclone.conf"
 
 
-def managed_remote_names():
-    """Remote IDs created by this plugin, derived from its per-remote files."""
-    remote_dir = STATE_DIR / "remotes"
+# ---------------------------------------------------------------- records
+
+
+def unquote_record_value(raw):
+    """Undo bash's %q quoting well enough for names, labels and paths."""
+    raw = raw.strip()
+    if raw.startswith("$'") and raw.endswith("'"):
+        # ANSI-C quoting, used by %q for control characters. Rare in practice.
+        try:
+            return raw[2:-1].encode("utf-8").decode("unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            return raw[2:-1]
     try:
-        return {
-            path.stem
-            for path in remote_dir.glob("*.conf")
-            if path.is_file()
-            and not path.is_symlink()
-            and REMOTE_NAME_PATTERN.fullmatch(path.stem)
-        }
+        parts = shlex.split(raw)
+    except ValueError:
+        return raw
+    return parts[0] if parts else ""
+
+
+def parse_record(path):
+    """A per-service ownership record: key=value lines written with %q."""
+    record = {}
+    try:
+        text = path.read_text(encoding="utf-8")
     except OSError:
-        return set()
+        return record
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        record[key.strip()] = unquote_record_value(value)
+    return record
 
 
-def read_remotes(path, managed_names):
-    """Parse managed remote names and types. Never returns secrets."""
-    if not path.exists() or not managed_names:
-        return []
+def managed_services():
+    """Every service this plugin owns, keyed by id, with its record."""
+    remote_dir = STATE_DIR / "remotes"
+    services = {}
+    try:
+        paths = sorted(remote_dir.glob("*.conf"))
+    except OSError:
+        return services
+    for path in paths:
+        if not path.is_file() or path.is_symlink():
+            continue
+        name = path.stem
+        if not REMOTE_NAME_PATTERN.fullmatch(name):
+            continue
+        record = parse_record(path)
+        env_kind = record.get("env_kind", "host") or "host"
+        if env_kind not in ENV_KINDS:
+            env_kind = "host"
+        env_name = record.get("env_name", "") if env_kind != "host" else ""
+        if env_kind != "host" and not ENV_NAME_PATTERN.fullmatch(env_name or ""):
+            # A record that names a container we cannot address safely is
+            # shown, but never used to build a command line.
+            env_kind, env_name = "host", ""
+            record["_broken_env"] = True
+        services[name] = {
+            "name": name,
+            "remote": record.get("remote") or name,
+            "label": record.get("label", ""),
+            "envKind": env_kind,
+            "envName": env_name,
+            "envUser": record.get("env_user", "") if env_kind in ("docker", "podman") else "",
+            "mountDir": record.get("mount_dir", ""),
+            "brokenEnv": record.get("_broken_env", False),
+        }
+    return services
+
+
+# ---------------------------------------------------------------- environments
+
+
+def env_label(kind, name):
+    if kind == "host":
+        return "Host"
+    return f"{kind.capitalize()} {name}"
+
+
+def env_exec_command(kind, name, user, command):
+    """The argv that runs `command` inside an environment. Never a shell string."""
+    if kind == "host":
+        return list(command)
+    if kind == "distrobox":
+        return ["distrobox", "enter", "--name", name, "--", *command]
+    if kind in ("docker", "podman"):
+        argv = [kind, "exec", "-i"]
+        if user:
+            argv += ["-u", user]
+        return [*argv, name, *command]
+    raise ValueError(f"unknown environment kind: {kind}")
+
+
+def env_running(kind, name):
+    if kind == "host":
+        return True
+    if kind == "distrobox":
+        if not which("distrobox"):
+            return False
+        code, out = run(["distrobox", "list", "--no-color"])
+        if code != 0:
+            return False
+        for line in out.splitlines()[1:]:
+            cells = [cell.strip() for cell in line.split("|")]
+            if len(cells) >= 3 and cells[1] == name:
+                return cells[2].lower().startswith(("up", "running"))
+        return False
+    if kind in ("docker", "podman"):
+        if not which(kind):
+            return False
+        code, out = run([kind, "inspect", "-f", "{{.State.Running}}", name])
+        return code == 0 and out.strip() == "true"
+    return False
+
+
+def parse_redacted_config(text):
+    """Remote name -> {type, hasAuth} from `rclone config redacted` output."""
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read_string(text)
+    except configparser.Error:
+        return {}
+    remotes = {}
+    for section in parser.sections():
+        backend = parser[section].get("type", "")
+        auth_key = "trust_token" if backend == "iclouddrive" else "token"
+        remotes[section] = {
+            "type": backend,
+            # Redaction replaces a present secret with XXX; an absent key stays
+            # absent, which is the only thing this needs to know.
+            "hasAuth": bool(parser[section].get(auth_key)),
+        }
+    return remotes
+
+
+def parse_mountinfo(text):
+    """Every fuse mountpoint in a mount table, decoded, keyed by path -> source."""
+    found = {}
+    for line in text.splitlines():
+        # ... mountpoint options - fstype source superopts
+        parts = line.split(" - ")
+        if len(parts) < 2:
+            continue
+        left = parts[0].split()
+        right = parts[1].split()
+        if len(left) < 5 or not right:
+            continue
+        if right[0] not in ("fuse.rclone", "fuse"):
+            continue
+        # mountinfo octal-escapes spaces and a few delimiters. Decode
+        # only those kernel escapes; unicode_escape would corrupt
+        # every non-ASCII character that was already valid UTF-8.
+        path = MOUNTINFO_ESCAPE_PATTERN.sub(
+            lambda match: chr(int(match.group(1), 8)), left[4]
+        )
+        found[path] = right[1] if len(right) > 1 else ""
+    return found
+
+
+def probe_environment(kind, name, user):
+    """One exec: home, rclone presence, redacted remotes, live mounts."""
+    result = {"reachable": False, "home": "", "rclone": False, "remotes": {}, "mounts": {}}
+    if not env_running(kind, name):
+        return result
+    code, out = run(
+        env_exec_command(kind, name, user, ["sh", "-c", ENV_PROBE_SCRIPT]), timeout=15
+    )
+    if code != 0 and "@@HOME" not in out:
+        return result
+    sections = {}
+    current = None
+    for line in out.splitlines():
+        if line.startswith("@@") and line[2:] in ("HOME", "RCLONE", "CONFIG", "MOUNTS"):
+            current = line[2:]
+            sections[current] = []
+            continue
+        if current is not None:
+            sections[current].append(line)
+    result["reachable"] = True
+    result["home"] = next((l for l in sections.get("HOME", []) if l), "")
+    result["rclone"] = any(l.strip() == "yes" for l in sections.get("RCLONE", []))
+    result["remotes"] = parse_redacted_config("\n".join(sections.get("CONFIG", [])))
+    result["mounts"] = parse_mountinfo("\n".join(sections.get("MOUNTS", [])))
+    return result
+
+
+# ---------------------------------------------------------------- host
+
+
+def read_remotes(path):
+    """Parse remote names and types from rclone.conf. Never returns secrets."""
+    if not path.exists():
+        return {}
     parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read(path, encoding="utf-8")
     except (OSError, configparser.Error):
-        return []
-
-    remotes = []
+        return {}
+    remotes = {}
     for name in parser.sections():
-        if name not in managed_names:
-            continue
         backend = parser[name].get("type", "")
         # Most browser-authenticated providers store `token`; iCloud's SRP/2FA
         # flow stores a trust token instead.
         auth_key = "trust_token" if backend == "iclouddrive" else "token"
-        remotes.append(
-            {
-                "name": name,
-                "type": backend,
-                # A provider name reads better than a remote id, but only while
-                # it identifies one service. Backends we have no name for fall
-                # back to what the user called it, which beats showing them the
-                # rclone backend id.
-                "label": PROVIDER_LABELS.get(backend, name),
-                "hasAuth": bool(parser[name].get(auth_key)),
-            }
-        )
-
-    # Two accounts on the same provider would otherwise be two rows both
-    # labelled "Google Drive", with nothing to tell them apart.
-    counts = {}
-    for remote in remotes:
-        counts[remote["label"]] = counts.get(remote["label"], 0) + 1
-    for remote in remotes:
-        if counts[remote["label"]] > 1 and remote["label"] != remote["name"]:
-            remote["label"] = f"{remote['label']} ({remote['name']})"
-
+        remotes[name] = {"type": backend, "hasAuth": bool(parser[name].get(auth_key))}
     return remotes
 
 
 def mounted_paths():
     """Every fuse.rclone mountpoint currently live, from the kernel."""
-    found = set()
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as handle:
-            for line in handle:
-                # ... mountpoint options - fstype source superopts
-                parts = line.split(" - ")
-                if len(parts) < 2:
-                    continue
-                left = parts[0].split()
-                right = parts[1].split()
-                if len(left) < 5 or not right:
-                    continue
-                if right[0] not in ("fuse.rclone", "fuse"):
-                    continue
-                # mountinfo octal-escapes spaces and a few delimiters. Decode
-                # only those kernel escapes; unicode_escape would corrupt
-                # every non-ASCII character that was already valid UTF-8.
-                found.add(
-                    MOUNTINFO_ESCAPE_PATTERN.sub(
-                        lambda match: chr(int(match.group(1), 8)), left[4]
-                    )
-                )
+            return set(parse_mountinfo(handle.read()))
     except OSError:
         return set()
-    return found
 
 
 def unit_states(names):
@@ -292,10 +441,10 @@ def icloud_quota(name, rclone_config):
         return 0, 0, False
 
 
-def quota(name, backend, max_age, rclone_config, refresh):
+def quota(service, backend, max_age, rclone_config, refresh):
     """Return cached quota, refreshing it from the provider when requested."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CACHE_DIR / f"quota-{name}.json"
+    cache_file = CACHE_DIR / f"quota-{service['name']}.json"
 
     if cache_file.exists():
         try:
@@ -311,7 +460,11 @@ def quota(name, backend, max_age, rclone_config, refresh):
     if not refresh:
         return 0, 0, False
 
-    code, out = run(["rclone", "about", f"{name}:", "--json"], timeout=25)
+    command = env_exec_command(
+        service["envKind"], service["envName"], service["envUser"],
+        ["rclone", "about", f"{service['remote']}:", "--json"],
+    )
+    code, out = run(command, timeout=25)
     used, total, known = 0, 0, False
     if code == 0 and out:
         try:
@@ -321,8 +474,8 @@ def quota(name, backend, max_age, rclone_config, refresh):
             known = total > 0
         except (ValueError, TypeError):
             pass
-    if not known and backend == "iclouddrive":
-        used, total, known = icloud_quota(name, rclone_config)
+    if not known and backend == "iclouddrive" and service["envKind"] == "host":
+        used, total, known = icloud_quota(service["remote"], rclone_config)
 
     try:
         cache_file.write_text(
@@ -357,6 +510,31 @@ def expand_root(value):
     return Path(os.path.expanduser(value or "~/Cloud"))
 
 
+def mount_path_for(service, root_raw, env_home):
+    """Where the service is mounted inside its environment."""
+    if service["mountDir"]:
+        return service["mountDir"]
+    root = root_raw or "~/Cloud"
+    if service["envKind"] == "host":
+        return str(expand_root(root) / service["name"])
+    if root == "~" or root.startswith("~/"):
+        if not env_home:
+            return ""
+        root = env_home.rstrip("/") + root[1:]
+    return f"{root.rstrip('/')}/{service['name']}"
+
+
+def display_labels(rows):
+    """Two accounts on the same provider would otherwise be two rows both
+    labelled "Google Drive", with nothing to tell them apart."""
+    counts = {}
+    for row in rows:
+        counts[row["label"]] = counts.get(row["label"], 0) + 1
+    for row in rows:
+        if counts[row["label"]] > 1 and row["label"] != row["name"]:
+            row["label"] = f"{row['label']} ({row['name']})"
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--root", default="~/Cloud")
@@ -385,46 +563,86 @@ def main():
         version = first[1] if len(first) > 1 else ""
 
     rclone_config = config_path()
-    remotes = read_remotes(rclone_config, managed_remote_names())
+    services = managed_services()
+    host_remotes = read_remotes(rclone_config)
     live = mounted_paths()
-    states = unit_states([r["name"] for r in remotes])
+    states = unit_states(list(services))
+
+    # One probe per distinct container, however many services live in it.
+    probes = {}
+    for service in services.values():
+        if service["envKind"] == "host":
+            continue
+        key = (service["envKind"], service["envName"], service["envUser"])
+        if key not in probes:
+            probes[key] = probe_environment(*key)
 
     unit_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
     unit_installed = any((unit_dir / f"{prefix}.service").exists() for prefix in UNIT_PREFIXES)
 
     rows = []
-    for remote in remotes:
-        name = remote["name"]
-        mount_path = str(root / name)
+    for name, service in services.items():
         unit = states.get(name, {
             "active": "inactive",
             "enabled": "disabled",
             "unit": f"{UNIT_PREFIXES[0]}{name}.service",
         })
-        is_mounted = mount_path in live
+        detail = ""
+        env_home = ""
+        if service["envKind"] == "host":
+            remotes = host_remotes
+            reachable = True
+            mounts = live
+        else:
+            probe = probes[(service["envKind"], service["envName"], service["envUser"])]
+            remotes = probe["remotes"]
+            reachable = probe["reachable"]
+            env_home = probe["home"]
+            mounts = set(probe["mounts"])
+
+        remote = remotes.get(service["remote"], {"type": "", "hasAuth": False})
+        mount_path = mount_path_for(service, args.root, env_home)
+        is_mounted = bool(mount_path) and mount_path in mounts
         state = classify(remote, is_mounted, unit)
+
+        label = service["label"] or PROVIDER_LABELS.get(remote["type"], name)
+        env_text = env_label(service["envKind"], service["envName"])
+
+        if service["brokenEnv"]:
+            state, detail = "failed", "Unreadable environment in this service's record"
+        elif service["envKind"] != "host" and not reachable:
+            if state not in ("mounted", "mounting"):
+                state, detail = "stopped", f"{env_text} is not running"
+        elif service["envKind"] != "host" and not probe["rclone"]:
+            state, detail = "failed", f"rclone is not installed in {env_text}"
+        elif not remote["type"] and reachable:
+            state, detail = "failed", f"No rclone remote named '{service['remote']}'"
 
         row = {
             "name": name,
+            "remote": service["remote"],
             "type": remote["type"],
-            "label": remote["label"],
+            "label": label,
+            "envKind": service["envKind"],
+            "envName": service["envName"],
+            "envLabel": env_text,
             "mountPath": mount_path,
             "mounted": is_mounted,
             "unitState": unit["active"],
             "autoMount": unit["enabled"] in ("enabled", "enabled-runtime"),
             "state": state,
-            "detail": "",
+            "detail": detail,
             "usedBytes": 0,
             "totalBytes": 0,
             "quotaKnown": False,
         }
 
-        if state == "failed":
+        if state == "failed" and not detail:
             row["detail"] = last_failure(unit["unit"])
 
         if state == "mounted":
             used, total, known = quota(
-                name,
+                service,
                 remote["type"],
                 args.quota_age,
                 rclone_config,
@@ -436,7 +654,9 @@ def main():
 
         rows.append(row)
 
-    rows.sort(key=lambda r: r["name"].lower())
+    display_labels(rows)
+    # Host first, then containers, alphabetical within each.
+    rows.sort(key=lambda r: (r["envKind"] != "host", r["envLabel"].lower(), r["name"].lower()))
 
     print(json.dumps({
         "ok": True,

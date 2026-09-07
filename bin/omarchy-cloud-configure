@@ -15,6 +15,8 @@ MOUNT="$BIN_DIR/omarchy-cloud-mount"
 
 # shellcheck source=omarchy-cloud-ui.sh
 source "$BIN_DIR/omarchy-cloud-ui.sh"
+# shellcheck source=omarchy-cloud-env.sh
+source "$BIN_DIR/omarchy-cloud-env.sh"
 trap hold_open EXIT
 
 REMOTE_NAME="${1:-}"
@@ -28,26 +30,27 @@ REMOTE_NAME="${1:-}"
   exit 1
 }
 
-REMOTE_TYPE="$(rclone config show "$REMOTE_NAME" 2>/dev/null | awk -F' = ' '/^type/ {print $2; exit}')"
-[[ -n "$REMOTE_TYPE" ]] || { bad "No connected service called '$REMOTE_NAME'."; exit 1; }
+# The service may live in a container; from here on `rclone` runs there.
+load_remote_record "$REMOTE_DIR/$REMOTE_NAME.conf" "$REMOTE_NAME"
+env_bind_rclone "$RECORD_ENV_KIND" "$RECORD_ENV_NAME" "$RECORD_ENV_USER"
+ENV_TEXT="$(env_label "$RECORD_ENV_KIND" "$RECORD_ENV_NAME")"
+RCLONE_REMOTE="$RECORD_REMOTE"
 
-label="$REMOTE_NAME"
-extra_flags=""
-# shellcheck source=/dev/null
-[[ -f "$REMOTE_DIR/$REMOTE_NAME.conf" ]] && source "$REMOTE_DIR/$REMOTE_NAME.conf"
+if [[ "$RECORD_ENV_KIND" != host ]] && ! env_running "$RECORD_ENV_KIND" "$RECORD_ENV_NAME"; then
+  bad "$ENV_TEXT is not running."
+  exit 1
+fi
+
+REMOTE_TYPE="$(rclone config show "$RCLONE_REMOTE" 2>/dev/null | awk -F' = ' '/^type/ {print $2; exit}')"
+[[ -n "$REMOTE_TYPE" ]] || { bad "No connected service called '$RCLONE_REMOTE' in $ENV_TEXT."; exit 1; }
+
+label="$RECORD_LABEL"
+extra_flags="$RECORD_EXTRA_FLAGS"
 
 save() {
-  local tmp
-  mkdir -p "$REMOTE_DIR" || return 1
-  tmp="$(mktemp "$REMOTE_DIR/.${REMOTE_NAME}.XXXXXX")" || return 1
-  {
-    printf '# Written by omarchy-cloud-configure for the %q remote.\n' "$REMOTE_NAME"
-    echo "# extra_flags is appended to the rclone mount command line."
-    printf 'label=%q\n' "$label"
-    printf 'extra_flags=%q\n' "$extra_flags"
-  } >"$tmp" || { rm -f "$tmp"; return 1; }
-  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
-  mv "$tmp" "$REMOTE_DIR/$REMOTE_NAME.conf"
+  RECORD_LABEL="$label"
+  RECORD_EXTRA_FLAGS="$extra_flags"
+  write_remote_record "$REMOTE_DIR/$REMOTE_NAME.conf" "$REMOTE_NAME" omarchy-cloud-configure
 }
 
 # Mount flags are read at start, so a change only takes effect on a restart.
@@ -135,7 +138,7 @@ configure_autostart() {
 # stop working during 2026 and has to move to its own credentials.
 credentials_current() {
   local id
-  id="$(rclone config show "$REMOTE_NAME" 2>/dev/null | awk -F' = ' '/^client_id/ {print $2; exit}')"
+  id="$(rclone config show "$RCLONE_REMOTE" 2>/dev/null | awk -F' = ' '/^client_id/ {print $2; exit}')"
   [[ -n "$id" ]] && echo "your own" || echo "rclone's shared (retiring during 2026)"
 }
 
@@ -162,7 +165,7 @@ configure_credentials() {
     return 0
   fi
 
-  rclone config update "$REMOTE_NAME" \
+  rclone config update "$RCLONE_REMOTE" \
     "client_id=$id" "client_secret=$secret" \
     config_refresh_token=false --no-output >/dev/null || {
     bad "Could not save the credentials."
@@ -173,7 +176,7 @@ configure_credentials() {
   # previous client. Signing in again is required, not optional.
   say "Credentials saved. Signing in again with them…"
   echo
-  if rclone config reconnect "$REMOTE_NAME:"; then
+  if rclone config reconnect "$RCLONE_REMOTE:"; then
     if [[ "$was_active" == "true" || "$was_enabled" == "true" ]]; then
       if ! "$MOUNT" start "$REMOTE_NAME"; then
         bad "Signed in, but the mount could not be started."
@@ -222,7 +225,11 @@ disconnect_service() {
 
 main() {
   while true; do
-    title "$label settings"
+    if [[ "$RECORD_ENV_KIND" == host ]]; then
+      title "$label settings"
+    else
+      title "$label settings — $ENV_TEXT"
+    fi
 
     local -a options=()
     if [[ "$REMOTE_TYPE" == "drive" ]]; then

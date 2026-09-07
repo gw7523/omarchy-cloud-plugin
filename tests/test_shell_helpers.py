@@ -190,6 +190,7 @@ printf '%s\\n' "$@" >"$TEST_LOG"
             "omarchy-cloud-connect",
             "omarchy-cloud-ui.sh",
             "omarchy-cloud-rclone-config.sh",
+            "omarchy-cloud-env.sh",
         ):
             shutil.copy2(REPO / "bin" / name, wizard_bin / name)
 
@@ -248,7 +249,7 @@ exit 1
         self.managed_remote()
         wizard_bin = self.root / "settings-bin"
         wizard_bin.mkdir()
-        for name in ("omarchy-cloud-configure", "omarchy-cloud-ui.sh"):
+        for name in ("omarchy-cloud-configure", "omarchy-cloud-ui.sh", "omarchy-cloud-env.sh"):
             shutil.copy2(REPO / "bin" / name, wizard_bin / name)
 
         event_log = self.root / "events.log"
@@ -326,6 +327,7 @@ exit 0
             "omarchy-cloud-reconnect",
             "omarchy-cloud-ui.sh",
             "omarchy-cloud-rclone-config.sh",
+            "omarchy-cloud-env.sh",
         ):
             shutil.copy2(REPO / "bin" / name, wizard_bin / name)
 

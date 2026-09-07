@@ -307,7 +307,7 @@ Panel {
           Text {
             visible: root.rcloneInstalled && root.remotes.length === 0
             width: parent.width
-            text: "Connect Google Drive, Dropbox or OneDrive to browse it in Files."
+            text: "Connect Google Drive, Dropbox, OneDrive, iCloud, Proton Drive or Nextcloud to browse it as a folder — here or inside a container."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -512,7 +512,9 @@ Panel {
       PanelActionButton {
         visible: !remoteRow.needsAuth
         iconText: remoteRow.isMounted ? Model.GLYPH_OPEN : Model.GLYPH_MOUNTED
-        tooltipText: remoteRow.isMounted ? "Open in Files" : "Mount now"
+        tooltipText: remoteRow.isMounted
+          ? (Model.isContainer(remoteRow.remote) ? "Open a shell there" : "Open in Files")
+          : "Mount now"
         foreground: root.foreground
         fontFamily: root.fontFamily
         enabled: root.cloud && !root.cloud.busy

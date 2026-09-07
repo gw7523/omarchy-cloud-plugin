@@ -77,14 +77,25 @@ function stateGlyph(state) {
 // problem if there is one, then the useful fact, then where it lives.
 function rowDetail(remote) {
   if (!remote) return ""
-  if (remote.state === "failed" && remote.detail) return String(remote.detail)
-  if (remote.state === "needs-auth") return "Sign-in needed"
-  if (remote.state === "mounted") {
+  var text
+  if (remote.state === "failed" && remote.detail) text = String(remote.detail)
+  else if (remote.state === "needs-auth") text = "Sign-in needed"
+  else if (remote.state === "mounted") {
     var usage = usageText(remote)
-    return usage !== "" ? usage : String(remote.mountPath || "")
+    text = usage !== "" ? usage : String(remote.mountPath || "")
   }
-  if (remote.state === "mounting") return "Starting…"
-  return remote.autoMount ? "Not mounted" : "Not mounted at login"
+  else if (remote.state === "mounting") text = "Starting…"
+  else if (remote.detail) text = String(remote.detail)
+  else text = remote.autoMount ? "Not mounted" : "Not mounted at login"
+  // A service inside a container says so; on the host, where most live,
+  // the extra word would be noise.
+  if (isContainer(remote) && text.indexOf(String(remote.envLabel)) === -1)
+    text = text + " · " + String(remote.envLabel)
+  return text
+}
+
+function isContainer(remote) {
+  return !!(remote && remote.envKind && remote.envKind !== "host" && remote.envLabel)
 }
 
 function aggregateState(remotes) {
