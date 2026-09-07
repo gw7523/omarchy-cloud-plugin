@@ -406,9 +406,18 @@ choose_credentials() {
     echo "prefers an app password: Settings → Security → Devices & sessions."
     echo
     local server
-    server="$(gum input --placeholder "https://cloud.example.com" --width 60)" || abort "Cancelled."
+    server="$(gum input --placeholder "cloud.example.com" --width 60)" || abort "Cancelled."
     server="${server%/}"
-    [[ "$server" =~ ^https?:// ]] || abort "The server address must start with http:// or https://."
+    [[ -n "$server" ]] || abort "A server address is required."
+    [[ "$server" =~ ^[A-Za-z][A-Za-z0-9+.-]*:// ]] || server="https://$server"
+    # Plain http sends the app password in clear, and a server behind a TLS
+    # front answers 301 -> https; the redirected request then arrives without
+    # credentials and Nextcloud reports a wrong password. Insist on https.
+    if [[ "$server" == http://* ]]; then
+      warn "Using https instead of http: plain http breaks WebDAV sign-in behind a TLS front."
+      server="https://${server#http://}"
+    fi
+    [[ "$server" =~ ^https:// ]] || abort "The server address must be an https:// URL."
     WEBDAV_USER="$(gum input --placeholder "Nextcloud username")" || abort "Cancelled."
     local app_password
     app_password="$(gum input --password --placeholder "app password")" || abort "Cancelled."
