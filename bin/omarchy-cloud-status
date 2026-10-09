@@ -331,6 +331,7 @@ def unit_states(names):
             "active": "inactive",
             "enabled": "disabled",
             "unit": f"{UNIT_PREFIXES[0]}{name}.service",
+            "invocation": "",
         }
         for name in names
     }
@@ -343,7 +344,10 @@ def unit_states(names):
         for name in names
     ]
     code, out = run(
-        ["systemctl", "--user", "show", "--property=Id,ActiveState,UnitFileState", *units]
+        [
+            "systemctl", "--user", "show",
+            "--property=Id,ActiveState,UnitFileState,InvocationID", *units,
+        ]
     )
     if code != 0 and not out:
         return states
@@ -379,6 +383,7 @@ def unit_states(names):
                 "active": fields.get("ActiveState", "inactive"),
                 "enabled": fields.get("UnitFileState", "disabled"),
                 "unit": unit_id,
+                "invocation": fields.get("InvocationID", ""),
             }
             if priority(candidate) > priority(states[name]):
                 states[name] = candidate
@@ -402,6 +407,35 @@ def last_failure(unit):
         if any(marker in line for marker in ("ERROR", "Failed to", "couldn't", "error")):
             return line[:200]
     return out.splitlines()[-1][:200] if out.splitlines() else ""
+
+
+# Errors a provider returns once a sign-in has lapsed. rclone keeps the mount
+# up and turns every request into an I/O error, so the unit looks healthy.
+AUTH_EXPIRED_MARKERS = (
+    "Invalid global session",  # iCloud: the ~30-day trust token expired
+    "invalid_grant",           # OAuth: refresh token revoked or expired
+)
+
+
+def sign_in_expired(unit):
+    """True if the unit's current run has logged a lapsed sign-in.
+
+    Scoped to the current invocation, so signing in again (which restarts the
+    unit) clears it.
+    """
+    invocation = unit.get("invocation", "")
+    if not invocation:
+        return False
+    code, out = run(
+        [
+            "journalctl", "--user", f"_SYSTEMD_INVOCATION_ID={invocation}",
+            "-n", "50", "--no-pager", "-o", "cat", "-p", "err",
+        ],
+        timeout=4,
+    )
+    if code != 0 or not out:
+        return False
+    return any(marker in out for marker in AUTH_EXPIRED_MARKERS)
 
 
 def icloud_quota(name, rclone_config):
@@ -586,6 +620,7 @@ def main():
             "active": "inactive",
             "enabled": "disabled",
             "unit": f"{UNIT_PREFIXES[0]}{name}.service",
+            "invocation": "",
         })
         detail = ""
         env_home = ""
@@ -604,6 +639,8 @@ def main():
         mount_path = mount_path_for(service, args.root, env_home)
         is_mounted = bool(mount_path) and mount_path in mounts
         state = classify(remote, is_mounted, unit)
+        if state == "mounted" and sign_in_expired(unit):
+            state, detail = "needs-auth", "Sign-in expired"
 
         label = service["label"] or PROVIDER_LABELS.get(remote["type"], name)
         env_text = env_label(service["envKind"], service["envName"])

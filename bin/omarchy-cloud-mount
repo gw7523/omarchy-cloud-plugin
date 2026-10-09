@@ -333,15 +333,16 @@ cmd_run() {
   local rclone_config mount_point
   rclone_config="$(rclone_config_path)"
   mount_point="$(service_mount_dir "$name")"
-  mkdir -p "$mount_point"
 
   # A previous crash can leave the mountpoint attached but dead, which makes
   # rclone refuse to mount and Nautilus report "Transport endpoint is not
   # connected". Clearing it is safe: a live mount is never lazily detached
-  # here because systemd stopped the old unit before starting this one.
+  # here because systemd stopped the old unit before starting this one. It
+  # must run before mkdir, which fails on a dead mountpoint and would exit.
   if ! mountpoint -q "$mount_point" 2>/dev/null; then
     fusermount3 -uz "$mount_point" 2>/dev/null || true
   fi
+  mkdir -p "$mount_point"
 
   local -a args=(mount "$RECORD_REMOTE:" "$mount_point" --config "$rclone_config")
   local flag
@@ -478,9 +479,10 @@ cmd_cleanup() {
     fi
     return 0
   fi
-  if mountpoint -q "$mount_point" 2>/dev/null; then
-    fusermount3 -uz "$mount_point" 2>/dev/null || true
-  fi
+  # rclone has exited by now, so anything still attached is dead -- including
+  # a mount it failed to release ("Device or resource busy"), which
+  # `mountpoint -q` cannot see. Detach unconditionally; it is a no-op otherwise.
+  fusermount3 -uz "$mount_point" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- control
