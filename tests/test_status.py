@@ -54,6 +54,43 @@ UnitFileState=enabled
         )
 
 
+class ExpiredSignInTests(unittest.TestCase):
+    ICLOUD_421 = (
+        'ERROR : IO error: HTTP error 421 (421 Misdirected Request) returned body: '
+        '"{\\"reason\\":\\"Invalid global session\\",\\"error\\":2}"'
+    )
+
+    def test_reads_invocation_id(self):
+        out = "Id=omarchy-cloud-mount@icloud.service\nActiveState=active\nUnitFileState=enabled\nInvocationID=abc123\n"
+        with patch.object(status, "run", return_value=(0, out)):
+            unit = status.unit_states(["icloud"])["icloud"]
+        self.assertEqual(unit["invocation"], "abc123")
+
+    def test_icloud_invalid_session_in_current_run_is_expired(self):
+        commands = []
+
+        def fake_run(command, timeout=5):
+            commands.append(command)
+            return 0, self.ICLOUD_421
+
+        with patch.object(status, "run", side_effect=fake_run):
+            self.assertTrue(status.sign_in_expired({"invocation": "abc123"}))
+        self.assertIn("_SYSTEMD_INVOCATION_ID=abc123", commands[0])
+
+    def test_oauth_invalid_grant_is_expired(self):
+        with patch.object(status, "run", return_value=(0, 'ERROR : couldn\'t fetch token: invalid_grant')):
+            self.assertTrue(status.sign_in_expired({"invocation": "abc123"}))
+
+    def test_other_errors_are_not_expired(self):
+        with patch.object(status, "run", return_value=(0, "ERROR : vfs cache: failed to upload")):
+            self.assertFalse(status.sign_in_expired({"invocation": "abc123"}))
+
+    def test_no_invocation_skips_the_journal(self):
+        with patch.object(status, "run", side_effect=AssertionError("journal read")):
+            self.assertFalse(status.sign_in_expired({"invocation": ""}))
+            self.assertFalse(status.sign_in_expired({}))
+
+
 class MountInfoTests(unittest.TestCase):
     def test_preserves_utf8_and_decodes_only_kernel_octal_escapes(self):
         mountinfo = (
